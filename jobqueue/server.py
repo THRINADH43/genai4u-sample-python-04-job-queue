@@ -1,6 +1,7 @@
 """HTTP API built on http.server.
 
-POST /jobs        {"kind": "add", "payload": {"numbers": [1, 2]}}  -> 201 {"id": ...}
+POST /jobs        {"type": "count_words", "text": "hello world"}  -> 201 {"id": ...}
+                  {"type": "sleep", "seconds": 3}
 GET  /jobs/<id>   -> 200 job, or 404
 GET  /health      -> 200
 """
@@ -11,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from jobqueue.config import load_config
 from jobqueue.store import JobStore
-from jobqueue.tasks import TASKS
+from jobqueue.tasks import validate
 from jobqueue.workers import WorkerPool
 
 log = logging.getLogger("jobqueue")
@@ -45,12 +46,13 @@ def make_handler(store):
                 body = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
                 return self._send(400, {"error": "body must be JSON"})
-            kind = body.get("kind") if isinstance(body, dict) else None
-            if kind not in TASKS:
-                return self._send(400, {"error": f"kind must be one of {sorted(TASKS)}"})
-            payload = body.get("payload", {})
-            if not isinstance(payload, dict):
-                return self._send(400, {"error": "payload must be an object"})
+            if not isinstance(body, dict):
+                return self._send(400, {"error": "body must be a JSON object"})
+            kind = body.get("type")
+            payload = {k: v for k, v in body.items() if k != "type"}
+            error = validate(kind, payload)
+            if error:
+                return self._send(400, {"error": error})
             job_id = store.add(kind, payload)
             log.info("queued job %s (%s)", job_id, kind)
             self._send(201, {"id": job_id, "status": "queued"})

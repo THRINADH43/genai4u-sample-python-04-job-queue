@@ -34,7 +34,7 @@ class StoreTests(unittest.TestCase):
 
     def test_running_job_is_requeued_after_restart(self):
         store = JobStore(self.path)
-        job_id = store.add("add", {"numbers": [1]})
+        job_id = store.add("count_words", {"text": "a b"})
         store.claim_next()
         self.assertEqual(store.get(job_id)["status"], "running")
         store2 = JobStore(self.path)  # a "restart"
@@ -42,7 +42,7 @@ class StoreTests(unittest.TestCase):
 
     def test_no_job_is_claimed_twice(self):
         store = JobStore(self.path)
-        ids = {store.add("add", {"numbers": [i]}) for i in range(40)}
+        ids = {store.add("count_words", {"text": "x " * i}) for i in range(40)}
         claimed, lock = [], threading.Lock()
 
         def claim():
@@ -63,24 +63,24 @@ class WorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             store = JobStore(os.path.join(d, "jobs.db"))
             pool = WorkerPool(store, size=4, poll_seconds=0.01)
-            ids = [store.add("sleep", {"seconds": 0.5}) for _ in range(4)]
+            ids = [store.add("sleep", {"seconds": 1}) for _ in range(4)]
             start = time.time()
             pool.start()
             for job_id in ids:
                 self.assertEqual(wait_for(store, job_id)["status"], "done")
             pool.stop()
-            self.assertLess(time.time() - start, 1.5)  # 4 x 0.5s one by one would be 2s
+            self.assertLess(time.time() - start, 2.5)  # 4 x 1s one by one would be 4s
 
     def test_failing_job_is_marked_failed(self):
         with tempfile.TemporaryDirectory() as d:
             store = JobStore(os.path.join(d, "jobs.db"))
             pool = WorkerPool(store, size=1, poll_seconds=0.01)
-            job_id = store.add("add", {"wrong": 1})
+            job_id = store.add("count_words", {"wrong": 1})  # skipped validation, as an old row might
             pool.start()
             job = wait_for(store, job_id)
             pool.stop()
             self.assertEqual(job["status"], "failed")
-            self.assertIn("numbers", job["error"])
+            self.assertIn("text", job["error"])
 
 
 class ApiTests(unittest.TestCase):
@@ -110,16 +110,25 @@ class ApiTests(unittest.TestCase):
             return err.code, json.loads(err.read())
 
     def test_submit_and_read(self):
-        status, body = self.request("POST", "/jobs", {"kind": "add", "payload": {"numbers": [2, 3]}})
+        status, body = self.request("POST", "/jobs", {"type": "count_words", "text": "one two three"})
         self.assertEqual(status, 201)
         job = wait_for(self.store, body["id"])
         status, job = self.request("GET", f"/jobs/{body['id']}")
         self.assertEqual(status, 200)
-        self.assertEqual(job["result"], {"sum": 5})
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["result"], {"words": 3})
 
-    def test_unknown_kind_is_400(self):
-        status, _ = self.request("POST", "/jobs", {"kind": "format_disk"})
-        self.assertEqual(status, 400)
+    def test_bad_jobs_are_400(self):
+        for body in [{"type": "format_disk"}, {"type": "sleep", "seconds": 60}, {"type": "sleep", "seconds": "3"},
+                     {"type": "count_words"}, ["not", "an", "object"]]:
+            status, _ = self.request("POST", "/jobs", body)
+            self.assertEqual(status, 400, body)
+
+    def test_bad_json_is_400(self):
+        req = urllib.request.Request(self.base + "/jobs", data=b"{oops", method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req)
+        self.assertEqual(ctx.exception.code, 400)
 
     def test_missing_job_is_404(self):
         status, _ = self.request("GET", "/jobs/nope")
